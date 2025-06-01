@@ -9,7 +9,7 @@ from langchain.agents import AgentExecutor, create_react_agent
 # from utils.custom_output_parser import CustomOutputParser
 
 from langgraph.checkpoint.memory import MemorySaver
-from typing import Literal, Annotated, List
+from typing import Literal, Annotated, List, Optional # Make sure Optional is imported
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, add_messages
 from langgraph.prebuilt import create_react_agent
@@ -131,12 +131,119 @@ class AgentState(TypedDict):
     slides: list[dict]
     summary: list[dict]
     extracted_design_attributes: dict # Added for storing design attributes
+    task_plan: Optional[dict] # New field for the planning agent's output
+
+# Make sure json is imported:
+# import json # Already imported globally
+# Make sure Command is imported from langgraph.types
+# from langgraph.types import Command # Already imported globally
+# Make sure HumanMessage is imported from langchain_core.messages
+# from langchain_core.messages import HumanMessage # Already imported globally
+
+# ... (other imports and LLM instantiations like LLM_4o)
+
+def planning_agent_node(state: AgentState, config: dict) -> Command[Literal["supervisor"]]:
+    """
+    Agent that generates a plan based on the user's input.
+    """
+    logger.info("planning_agent_node: Starting plan generation.")
+    agent_invoke_start_time = time.perf_counter()
+
+    user_input = state["input"]
+
+    # Define the plan structure for the LLM prompt
+    plan_structure_example = {
+        "user_request": "<original user request string>",
+        "parsed_goal": "<a concise statement of what the user wants to achieve, inferred by the planning agent>",
+        "tasks": [
+            {
+                "task_id": 1,
+                "task_description": "<a specific sub-task to be performed>",
+                "target_agent": "<optional: suggested agent to handle this task, e.g., 'outline_agent', 'research_agent'>",
+                "inputs": ["<list of information/state fields this task depends on>"],
+                "outputs": ["<list of state fields this task is expected to populate>"]
+            }
+            # ... more tasks
+        ],
+        "execution_summary": "<optional: a brief summary of how the tasks combine to meet the goal>"
+    }
+
+    prompt = f"""You are a planning assistant. Your role is to analyze the user's request and create a structured plan to address it.
+The user's request is: '{user_input}'
+
+Based on this request, generate a plan with the following JSON structure:
+{json.dumps(plan_structure_example, indent=2)}
+
+Key considerations for your plan:
+- `user_request`: Should be the exact user input: {user_input}.
+- `parsed_goal`: Clearly state the main objective derived from the user's request.
+- `tasks`: Break down the goal into actionable steps.
+    - `task_description`: Be specific about what each task entails.
+    - `target_agent`: If applicable, suggest which type of agent or capability (e.g., 'outline_agent', 'slide_agent', 'web_search_tool', 'image_generation_tool') would be suitable for the task. If unsure, use 'generic_agent' or leave empty.
+    - `inputs`: List any data or state fields the task would need. For the first task, this might be the 'user_request' or 'parsed_goal'. For subsequent tasks, it could be outputs from previous tasks.
+    - `outputs`: Describe what each task is expected to produce or which state fields it will update.
+- `execution_summary`: Briefly explain how the planned tasks collectively achieve the `parsed_goal`.
+
+Ensure your output is ONLY a valid JSON object adhering to this structure. Do not include any explanatory text before or after the JSON.
+"""
+
+    try:
+        # Using LLM_4o as an example, can be changed to Gemini() or other LLMs defined in the file
+        response = LLM_4o.invoke(prompt, config=config)
+        llm_call_duration = time.perf_counter() - agent_invoke_start_time
+        logger.info(f"planning_agent_node: LLM invocation completed in {llm_call_duration:.2f} seconds.")
+
+        content = response.content if hasattr(response, 'content') else str(response)
+
+        # Clean the content: remove potential markdown code block fences
+        if content.strip().startswith("```json"):
+            content = content.strip()[7:]
+            if content.endswith("```"):
+                content = content[:-3]
+        content = content.strip()
+
+        logger.debug(f"planning_agent_node: Raw LLM output: {content}")
+
+        parsed_plan = json.loads(content)
+
+        logger.info(f"planning_agent_node: Successfully parsed plan: {parsed_plan}")
+
+        return Command(
+            update={
+                "messages": [HumanMessage(content=f"Generated plan: {json.dumps(parsed_plan, indent=2)}", name="planning_agent")],
+                "task_plan": parsed_plan
+            },
+            goto="supervisor"
+        )
+    except json.JSONDecodeError as e:
+        llm_call_duration = time.perf_counter() - agent_invoke_start_time
+        logger.error(f"planning_agent_node: JSONDecodeError after {llm_call_duration:.2f} seconds: {e}. LLM Output was: {content}")
+        # Fallback or error handling: Update state with error message or empty plan
+        error_message = f"Failed to generate a valid plan due to JSON decoding error: {e}. LLM output: {content}"
+        return Command(
+            update={
+                "messages": [HumanMessage(content=error_message, name="planning_agent")],
+                "task_plan": {"error": "JSONDecodeError", "raw_output": content}
+            },
+            goto="supervisor" # Or perhaps an error handling node if one exists
+        )
+    except Exception as e:
+        llm_call_duration = time.perf_counter() - agent_invoke_start_time
+        logger.error(f"planning_agent_node: Unexpected error after {llm_call_duration:.2f} seconds: {e}", exc_info=True)
+        error_message = f"An unexpected error occurred during plan generation: {e}."
+        return Command(
+            update={
+                "messages": [HumanMessage(content=error_message, name="planning_agent")],
+                "task_plan": {"error": "Exception", "details": str(e)}
+            },
+            goto="supervisor"
+        )
 
 members = ["outline_agent", "slide_agent", "summarizer"]
 options = members + ["FINISH"]
 
 class Router(TypedDict):
-    next: Literal["outline_agent", "slide_agent", "summarizer", "FINISH"]
+    next: Literal["planning_agent", "outline_agent", "slide_agent", "summarizer", "FINISH"]
 
 class Slide(TypedDict):
     slide_number: int
@@ -146,7 +253,7 @@ class Slide(TypedDict):
 class Summarize(TypedDict):
     slides: list[Slide]
 
-def supervisor_node(state: AgentState, config: dict) -> Command[Literal["outline_agent", "slide_agent", "summarizer", "__end__"]]:
+def supervisor_node(state: AgentState, config: dict) -> Command[Literal["planning_agent", "outline_agent", "slide_agent", "summarizer", "__end__"]]: # Add "planning_agent" to Literal
     """
     Router function that decides which agent should run next based on the current state.
 
@@ -157,6 +264,11 @@ def supervisor_node(state: AgentState, config: dict) -> Command[Literal["outline
         Command indicating which node to go to next
     """
     logger.info("Supervisor node: Starting workflow routing")
+
+    # If no plan exists yet, route to planning_agent first.
+    if not state.get("task_plan"):
+        logger.info("Supervisor node: No task_plan found. Routing to planning_agent.")
+        return Command(goto="planning_agent", update={"next": "planning_agent"})
 
     last_message = state["messages"][-1] if state["messages"] else None
 
@@ -185,21 +297,39 @@ def supervisor_node(state: AgentState, config: dict) -> Command[Literal["outline
     else:
         summary_info = "No summary has been generated yet."
 
-    # Keep system prompt largely the same, as LLM still needs full context for its decisions
+    task_plan_summary = "Not yet generated."
+    if state.get("task_plan"):
+        plan_data = state["task_plan"]
+        if isinstance(plan_data, dict):
+            goal = plan_data.get("parsed_goal", "N/A")
+            tasks_count = len(plan_data.get("tasks", []))
+            task_plan_summary = f"Goal: '{goal}', Tasks defined: {tasks_count}."
+            if "error" in plan_data: # If plan generation failed
+                task_plan_summary = f"Error during plan generation: {plan_data.get('error')}. Raw output: {plan_data.get('raw_output', '')[:100]}..."
+
     system_prompt = f"""
     You are a supervisor, tasked with managing a conversation between the following workers: {members}.
-    The last message was: {last_message.content if last_message else 'None'}. Current state outline: {'Exists' if state.get('outline') and state.get('outline') else 'Missing'}. Current state slides: {'Exists' if state.get('slides') and state.get('slides') else 'Missing'}.
-    You can respond to the user's general questions, then go to end.
-    Given the user's request and the current state, respond with the worker to act next.
-    {summary_info}
+    The user's initial request has been processed by a planning_agent, and the generated plan summary is: {task_plan_summary}
+    The full plan details are in the state ('task_plan') if you need to consider them for complex decisions, but usually the summary is enough.
+
+    The last message was: {last_message.content if last_message else 'None'}.
+    Current state of key items:
+    - Outline: {'Exists' if state.get('outline') and state.get('outline') else 'Missing'}
+    - Slides: {'Exists' if state.get('slides') and state.get('slides') else 'Missing'}
+    - Overall Presentation Summary: {'Exists' if state.get('summary') and state.get('summary') else 'Missing'}
+
+    Your role is to decide the next worker based on the current state and the overall plan.
+    You can also respond to the user's general questions, then go to FINISH.
 
     Workflow reminder:
-    - Normally, if an outline is ready, the next step is 'slide_agent'. (This might be handled deterministically now)
-    - Normally, if slides are generated, the next step is 'summarizer'. (This might be handled deterministically now)
-    - If a slide summary is available, you need to decide if slides need enhancement (not implemented yet, so usually FINISH) or if the process should FINISH.
+    - The `planning_agent` should have already run if a plan was needed.
+    - If a `task_plan` exists and an outline is missing, 'outline_agent' is typically next.
+    - If an outline is ready, the next step is 'slide_agent'.
+    - If slides are generated, the next step is 'summarizer'.
+    - If a slide summary is available, you usually FINISH unless further enhancements are requested (not implemented yet).
     - If any agent fails or provides unexpected output, decide the best course of action (e.g., retry, FINISH, or ask user).
 
-    When finished creating the presentation, or if instructed to stop, or if critical errors occur, go to FINISH.
+    When finished creating the presentation according to the plan, or if instructed to stop, or if critical errors occur, go to FINISH.
 
     Respond with ONLY one of these options: {', '.join(options)}
     """
@@ -240,31 +370,66 @@ def outline_agent_node(state: AgentState, config: dict) -> Command[Literal["supe
     logger.info("outline_agent_node: Starting outline generation process.")
     agent_invoke_start_time = time.perf_counter()
 
-    prompt = """You are a research assistant helping to create a presentation. Follow these steps:
+    task_plan = state.get("task_plan")
+    user_input = state.get("input", "") # Get original user input
 
-    1. First, use `web_search` to gather information about the topic. This will give you a list of relevant URLs and snippets.
-    2. Review the results from `web_search`. Identify specific websites that seem most promising for detailed information.
-    3. To get detailed information from a single specific website, use `crawl_url` (Note: this tool is now asynchronous, the system will handle the await).
-    4. If you have identified MULTIPLE important URLs from `web_search` that you need to fetch content from, you can use `crawl_urls_concurrently`. Provide this tool with a list of these URLs (e.g., `["url1", "url2", "url3"]`) to fetch their content more efficiently.
-    5. After gathering information, use `image_search` to find relevant images for the presentation (Note: this tool is also asynchronous).
-    6. Finally, generate the full presentation content based on all the gathered information (text from web searches, crawled content, and image details) and follow the user's instructions for the presentation structure.
+    plan_guidance = ""
+    if task_plan and isinstance(task_plan, dict) and "error" not in task_plan:
+        parsed_goal = task_plan.get("parsed_goal", "Not specified in plan.")
+        # Ensure user_request from plan is used if available, otherwise fallback to current user_input
+        user_request_from_plan = task_plan.get("user_request", user_input)
 
-    Use all the gathered information to generate the presentation content.
-    The presentation content should contains these slide:
-    - Cover slide
-    - Table of contents
-    - Introduction slide
-    - Main content slides
-    - Key points slides
-    - Graphs and charts slides
-    - Conclusion slide
-    - Reference slide
+        tasks_description_list = []
+        if "tasks" in task_plan and isinstance(task_plan["tasks"], list):
+            for t_idx, t in enumerate(task_plan["tasks"]):
+                if isinstance(t, dict):
+                    tasks_description_list.append(f"{t_idx + 1}. {t.get('task_description', 'No description')}")
+        tasks_description = "\n".join(tasks_description_list) if tasks_description_list else "No specific tasks listed in plan."
 
-    If the user ask for 5 slides of presentation for example, you should exclude cover slide and table of contents slide, make sure table of contents slide cover all the slides.
+        plan_guidance = f"""
+A plan has been generated for this request:
+User's Original Request (from plan): {user_request_from_plan}
+Overall Goal (from plan): {parsed_goal}
+Key Tasks Identified in Plan:
+{tasks_description}
 
-    IMPORTANT: You MUST use at least web_search, crawl_url and image_search before generating the outline.
-    IMPORTANT: Make the full presentation content with as many words as possible, not just the outline.
-    """
+Please USE THIS PLAN to guide your research and content generation. Focus on fulfilling the `Overall Goal` and addressing the `Key Tasks Identified in Plan`.
+The user's original request for the presentation topic was: '{user_request_from_plan}'.
+"""
+    else:
+        plan_guidance = f"""No detailed plan is available, or there was an error in plan generation.
+Please work based on the user's original request for the presentation topic: '{user_input}'
+"""
+
+    prompt = f"""You are a research assistant helping to create a presentation.
+{plan_guidance}
+
+Your general process to gather information and generate content is as follows:
+1.  **Understand the Goal**: Review the provided plan (if available) or the user's request to understand the core objectives.
+2.  **Web Search**: Use `web_search` to gather initial information and identify key sources related to the presentation topic or planned tasks.
+3.  **Crawl URLs**:
+    *   If `web_search` yields promising specific URLs, use `crawl_url` to get detailed content from individual sites.
+    *   If you identify MULTIPLE important URLs, use `crawl_urls_concurrently` for efficiency.
+4.  **Image Search**: Use `image_search` to find relevant images that can visually support the presentation content.
+5.  **Content Generation**: Based on ALL gathered information (web search results, crawled text, image details), generate the FULL presentation content. This is not just an outline, but the actual text and structure for each slide.
+
+Standard Presentation Structure (unless the plan or request specifies otherwise):
+-   Cover slide (Title of presentation, related to the goal)
+-   Table of Contents (listing all major sections/slides)
+-   Introduction slide (Brief overview of the presentation topic)
+-   Main Content slides (These should address the key tasks from the plan or cover main aspects of the user's request. Each task/aspect might span multiple slides if necessary.)
+-   Key Points slide (Summarizing the most important takeaways)
+-   Graphs and Charts slides (If your research uncovers data that can be visualized)
+-   Conclusion slide (Final thoughts and wrap-up)
+-   Reference slide (List of sources used)
+
+If a specific number of slides is requested (e.g., "5 slides"), this count typically refers to the main content slides. The cover, table of contents, conclusion, and references are usually in addition. Always ensure the Table of Contents accurately reflects all slides.
+
+CRITICAL REQUIREMENTS:
+-   You MUST use information gathering tools (`web_search`, `crawl_url`/`crawl_urls_concurrently`, `image_search`) BEFORE generating the final presentation content. Do not invent content.
+-   The output should be the FULL presentation content, detailed and comprehensive, not just a list of slide titles. Imagine you are writing the text that will go onto each slide.
+-   If a plan is provided, your research and content MUST align with the `Overall Goal` and `Key Tasks` outlined in that plan.
+"""
 
     # Import the new crawl_urls_concurrently tool
     from utils.tools import crawl_urls_concurrently
@@ -793,6 +958,7 @@ def summarizer_node(state: AgentState) -> Command[Literal["supervisor"]]:
 
 
 graph = StateGraph(AgentState)
+graph.add_node("planning_agent", planning_agent_node) # New planning agent node
 graph.add_node("supervisor", supervisor_node) # supervisor_node now accepts config
 graph.add_node("outline_agent", outline_agent_node) # outline_agent_node now accepts config
 graph.add_node("slide_agent", slide_agent_node) # slide_agent_node now accepts config
@@ -839,7 +1005,8 @@ while True:
         "input": user_input,
         "slides": [],
         "summary": [], # Ensure summary is reset
-        "extracted_design_attributes": {} # Ensure design attributes are reset
+        "extracted_design_attributes": {}, # Ensure design attributes are reset
+        "task_plan": None # Initialize the new field
     }
     logger.info(f"Created initial state for trace_id: {current_trace_id}")
 

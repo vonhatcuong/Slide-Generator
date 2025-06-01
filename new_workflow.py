@@ -132,6 +132,7 @@ class AgentState(TypedDict):
     summary: list[dict]
     extracted_design_attributes: dict # Added for storing design attributes
     task_plan: Optional[dict] # New field for the planning agent's output
+    human_input_request: Optional[dict] # For signaling human review is needed
 
 # Make sure json is imported:
 # import json # Already imported globally
@@ -142,7 +143,7 @@ class AgentState(TypedDict):
 
 # ... (other imports and LLM instantiations like LLM_4o)
 
-def planning_agent_node(state: AgentState, config: dict) -> Command[Literal["supervisor"]]:
+def planning_agent_node(state: AgentState, config: dict) -> Command[Literal["human_review_node"]]:
     """
     Agent that generates a plan based on the user's input.
     """
@@ -213,7 +214,7 @@ Ensure your output is ONLY a valid JSON object adhering to this structure. Do no
                 "messages": [HumanMessage(content=f"Generated plan: {json.dumps(parsed_plan, indent=2)}", name="planning_agent")],
                 "task_plan": parsed_plan
             },
-            goto="supervisor"
+            goto="human_review_node"
         )
     except json.JSONDecodeError as e:
         llm_call_duration = time.perf_counter() - agent_invoke_start_time
@@ -225,7 +226,7 @@ Ensure your output is ONLY a valid JSON object adhering to this structure. Do no
                 "messages": [HumanMessage(content=error_message, name="planning_agent")],
                 "task_plan": {"error": "JSONDecodeError", "raw_output": content}
             },
-            goto="supervisor" # Or perhaps an error handling node if one exists
+            goto="human_review_node" # Or perhaps an error handling node if one exists
         )
     except Exception as e:
         llm_call_duration = time.perf_counter() - agent_invoke_start_time
@@ -236,8 +237,74 @@ Ensure your output is ONLY a valid JSON object adhering to this structure. Do no
                 "messages": [HumanMessage(content=error_message, name="planning_agent")],
                 "task_plan": {"error": "Exception", "details": str(e)}
             },
-            goto="supervisor"
+            goto="human_review_node"
         )
+
+# Ensure these are imported
+# import json # Already imported
+# from typing import Optional, Literal # Added Optional / Already imported
+# from langchain_core.messages import HumanMessage # Already imported
+# from langgraph.types import Command # Already imported
+
+# Function definition for human_review_node (to be placed appropriately, e.g. after planning_agent_node)
+def human_review_node(state: AgentState, config: dict) -> Command[Literal["supervisor"]]:
+    """
+    Node that prepares for human review of the generated plan.
+    It populates 'human_input_request' in the state, which the main application loop
+    should detect to pause and request input from the human user.
+    """
+    logger.info("human_review_node: Preparing for human plan review.")
+    current_plan = state.get("task_plan")
+    human_input_request_content = None
+    next_node = "supervisor" # Default next node
+
+    if not current_plan or (isinstance(current_plan, dict) and "error" in current_plan):
+        logger.warning("human_review_node: No valid plan found or plan contains errors. Skipping human review.")
+        message_content = "No valid plan available for review, or plan generation failed. Skipping human review step."
+        if isinstance(current_plan, dict) and "error" in current_plan:
+            message_content = f"Plan generation resulted in an error: {current_plan.get('raw_output', 'Unknown error')[:200]}... Skipping human review step."
+
+        # Update messages, clear any pending request, and go to supervisor
+        updated_messages = state.get("messages", []) + [HumanMessage(content=message_content, name="human_review_node")]
+        return Command(
+            update={"messages": updated_messages, "human_input_request": None},
+            goto=next_node
+        )
+
+    try:
+        plan_str_pretty = json.dumps(current_plan, indent=2)
+
+        prompt_message_for_human = (
+            f"Please review the following generated plan:\n\n{plan_str_pretty}\n\n"
+            "If you want to make changes, please provide the complete edited JSON plan. "
+            "If the plan is acceptable, please type 'approve' or 'no changes'."
+        )
+
+        human_input_request_content = {
+            "type": "edit_plan",
+            "message_to_user": prompt_message_for_human,
+            "current_plan_json": plan_str_pretty # Send the pretty-printed version for easy copy-paste
+        }
+        logger.info(f"human_review_node: Plan prepared for human review. Request: {human_input_request_content}")
+
+    except Exception as e:
+        logger.error(f"human_review_node: Could not serialize current plan to JSON for human review: {e}", exc_info=True)
+        error_message = f"Error preparing plan for review: {e}. Proceeding with original plan and skipping human review."
+        # Update messages, clear any pending request, and go to supervisor
+        updated_messages = state.get("messages", []) + [HumanMessage(content=error_message, name="human_review_node")]
+        return Command(
+            update={"messages": updated_messages, "human_input_request": None, "task_plan": current_plan}, # Ensure original plan is still there
+            goto=next_node
+        )
+
+    # The plan is prepared for review. The main loop will handle the actual user interaction.
+    # This node signals that input is needed by populating 'human_input_request'.
+    # The 'task_plan' remains as is until updated by the main loop after user input.
+    updated_messages = state.get("messages", []) + [HumanMessage(content="Plan is now ready for your review. Please provide feedback or approval.", name="human_review_node")]
+    return Command(
+        update={"messages": updated_messages, "human_input_request": human_input_request_content},
+        goto=next_node # Or a specific "WAITING_FOR_HUMAN" node if we want graph to explicitly show this state
+    )
 
 members = ["outline_agent", "slide_agent", "summarizer"]
 options = members + ["FINISH"]
@@ -959,6 +1026,7 @@ def summarizer_node(state: AgentState) -> Command[Literal["supervisor"]]:
 
 graph = StateGraph(AgentState)
 graph.add_node("planning_agent", planning_agent_node) # New planning agent node
+graph.add_node("human_review_node", human_review_node) # ADD THIS LINE
 graph.add_node("supervisor", supervisor_node) # supervisor_node now accepts config
 graph.add_node("outline_agent", outline_agent_node) # outline_agent_node now accepts config
 graph.add_node("slide_agent", slide_agent_node) # slide_agent_node now accepts config
@@ -1006,7 +1074,8 @@ while True:
         "slides": [],
         "summary": [], # Ensure summary is reset
         "extracted_design_attributes": {}, # Ensure design attributes are reset
-        "task_plan": None # Initialize the new field
+        "task_plan": None, # Initialize the new field
+        "human_input_request": None # Initialize human input request field
     }
     logger.info(f"Created initial state for trace_id: {current_trace_id}")
 

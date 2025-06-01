@@ -28,6 +28,10 @@ import pprint
 
 OUTPUT_DIR = os.path.join(os.getcwd(), "semi_output")
 GENERATED_SLIDES_DIR = os.path.join(os.getcwd(), "generated_slides")
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+RULES_INSTRUCTION_PATH = os.path.join(SCRIPT_DIR, "rules", "instruction.txt")
+
 LLM = Gemini()
 LLM_4o = GPT_4o()
 LLM_o3 = GPT_o3()
@@ -35,7 +39,7 @@ LLM_Claude = Claude_3_7_Sonnet()
 
 
 # Instantiated once, if client settings are static
-langfuse_client = Langfuse(
+langfuse = Langfuse(
     secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
     public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
     host="https://cloud.langfuse.com"
@@ -93,10 +97,10 @@ def extract_design_attributes_from_html(html_content: str, attributes_to_extract
     """
     try:
         llm_call_start_time = time.perf_counter()
-        logger.info("extract_design_attributes_from_html: Calling LLM_Claude.invoke.")
-        response = LLM_Claude.invoke(prompt, config=config) # Using LLM_Claude as it's good with JSON
+        logger.info("extract_design_attributes_from_html: Calling LLM.invoke.")
+        response = LLM.invoke(prompt) # Using LLM_Claude as it's good with JSON
         llm_call_duration = time.perf_counter() - llm_call_start_time
-        logger.info(f"extract_design_attributes_from_html: LLM_Claude.invoke completed in {llm_call_duration:.2f} seconds.")
+        logger.info(f"extract_design_attributes_from_html: LLM.invoke completed in {llm_call_duration:.2f} seconds.")
 
         content = response.content if hasattr(response, 'content') else str(response)
         logger.debug(f"LLM response for attribute extraction: {content}")
@@ -142,13 +146,13 @@ class Slide(TypedDict):
 class Summarize(TypedDict):
     slides: list[Slide]
 
-def supervisor_node(state: AgentState) -> Command[Literal["outline_agent", "slide_agent", "summarizer", "__end__"]]:
+def supervisor_node(state: AgentState, config: dict) -> Command[Literal["outline_agent", "slide_agent", "summarizer", "__end__"]]:
     """
     Router function that decides which agent should run next based on the current state.
-    
+
     Args:
         state: The current state of the workflow
-        
+
     Returns:
         Command indicating which node to go to next
     """
@@ -180,7 +184,7 @@ def supervisor_node(state: AgentState) -> Command[Literal["outline_agent", "slid
         summary_info = f"This is the summary of the presentation: {state['summary']}"
     else:
         summary_info = "No summary has been generated yet."
-    
+
     # Keep system prompt largely the same, as LLM still needs full context for its decisions
     system_prompt = f"""
     You are a supervisor, tasked with managing a conversation between the following workers: {members}.
@@ -205,7 +209,7 @@ def supervisor_node(state: AgentState) -> Command[Literal["outline_agent", "slid
 
     response = LLM_4o.invoke(llm_messages, config=config)
     goto = response.content.strip()
-    
+
     if goto not in options:
         logger.warning(f"Invalid response from supervisor: {goto}. Defaulting based on state.")
         if not state.get("outline") or not state.get("outline"): # Check if outline is missing or empty
@@ -216,26 +220,26 @@ def supervisor_node(state: AgentState) -> Command[Literal["outline_agent", "slid
             goto = "summarizer"
         else:
             goto = "FINISH"
-        
+
     if goto == "FINISH":
         goto = END # Ensure using the correct graph end state
 
     logger.info(f"Supervisor node: LLM routed to {goto}")
     return Command(goto=goto, update={"next": goto})
 
-def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
+def outline_agent_node(state: AgentState, config: dict) -> Command[Literal["supervisor"]]:
     """
     Agent that generates the presentation outline.
-    
+
     Args:
         state: The current state of the workflow
-        
+
     Returns:
         Command to update the state and proceed to supervisor
     """
     logger.info("outline_agent_node: Starting outline generation process.")
     agent_invoke_start_time = time.perf_counter()
-    
+
     prompt = """You are a research assistant helping to create a presentation. Follow these steps:
 
     1. First, use `web_search` to gather information about the topic. This will give you a list of relevant URLs and snippets.
@@ -255,13 +259,13 @@ def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
     - Graphs and charts slides
     - Conclusion slide
     - Reference slide
-    
+
     If the user ask for 5 slides of presentation for example, you should exclude cover slide and table of contents slide, make sure table of contents slide cover all the slides.
-    
+
     IMPORTANT: You MUST use at least web_search, crawl_url and image_search before generating the outline.
     IMPORTANT: Make the full presentation content with as many words as possible, not just the outline.
     """
-    
+
     # Import the new crawl_urls_concurrently tool
     from utils.tools import crawl_urls_concurrently
 
@@ -270,17 +274,17 @@ def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
         tools=[image_search, crawl_url, web_search, crawl_urls_concurrently], # Added crawl_urls_concurrently
         prompt=prompt
     )
-    
+
     logger.info("outline_agent_node: Invoking ReAct agent for outline generation.")
     result = outline_agent.invoke(state, config=config)
     agent_invoke_duration = time.perf_counter() - agent_invoke_start_time
     logger.info(f"outline_agent_node: ReAct agent invocation completed in {agent_invoke_duration:.2f} seconds.")
-    
+
     # Extract tool outputs from messages
     outline = result
     images = []
     found_info = []
-    
+
     # Handle potential missing 'messages' key in result
     try:
         messages_list = result.get("messages", [])
@@ -291,15 +295,15 @@ def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
         messages_list = []
         if isinstance(result, list):
             messages_list = result
-    
+
     last_message_content = "Outline generation completed"
-    
+
     for message in messages_list:
         if isinstance(message, ToolMessage):
             logger.debug(f"Processing tool message: {message.name}")
             try:
                 content = json.loads(message.content)
-                
+
                 if message.name == "image_search":
                     if isinstance(content, dict) and "results" in content:
                         images.extend(content["results"])
@@ -356,7 +360,7 @@ def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
                             "content": str(message.content), # stringify the original content
                         })
                         logger.info(f"Found information from {message.name} (non-dict content)")
-                        
+
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON from {message.name}: {message.content}")
                 # if the content is a list of dicts (from crawl_urls_concurrently) but not valid JSON string
@@ -381,44 +385,44 @@ def outline_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
                         "source": message.name,
                         "content": str(message.content), # Ensure it's a string
                     })
-        
+
         # Save the last message content for the return
         if hasattr(message, "content"):
             last_message_content = message.content
-            
+
     logger.info(f"last_message_content: {last_message_content}")
-            
+
     return Command(
         update={
             "messages": [HumanMessage(content=last_message_content, name="outline_agent")],
-            "outline": outline,
+            "outline": outline, # This should be the actual outline content, not the whole result dict
             "images": images,
             "found_information": found_info
         },
         goto="supervisor"
     )
-    
-def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
+
+def slide_agent_node(state: AgentState, config: dict) -> Command[Literal["supervisor"]]:
     """
     Agent that generates the presentation slides.
-    
+
     Args:
         state: The current state of the workflow
-        
+
     Returns:
         Command to update the state and proceed to supervisor
     """
     logger.info("Slide agent: Starting slide generation")
-    
+
     images = state["images"]
     found_info = state["found_information"]
-    
-    
+
+
     @tool
     def generate_slide(slide_number: int, instructions: str, images_url: str, style: str, color_scheme: str, design_language: str, first_slide_reference: str = "", design_attrs: dict = None) -> tuple[str, str]:
         """
         Generate a single HTML slide, save it, and return its content along with a success message.
-        
+
         Args:
             slide_number: The number of the slide to generate
             instructions: The instructions for the slide content
@@ -436,7 +440,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
         tool_start_time = time.perf_counter()
         logger.info(f"generate_slide: Starting generation for slide #{slide_number}.")
         try:
-            with open("rules/instruction.txt", "r") as f:
+            with open(RULES_INSTRUCTION_PATH, "r") as f:
                 instruction_rules = f.read()
 
             # Add consistency reference if available
@@ -445,7 +449,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
                 consistency_instruction = f"""
                 IMPORTANT FOR CONSISTENCY (BROAD): This is the first slide that was generated. Use it as a reference for maintaining consistent design style, color scheme, layout patterns, and overall visual identity for aspects NOT covered by specific design_attrs:
                 {first_slide_reference}
-                
+
                 Please maintain the same general:
                 - Layout structure and spacing
                 - Design elements and visual style
@@ -481,7 +485,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
             Overall Presentation Style: {style}
             Color Scheme: {color_scheme} # This should align with instruction_rules' "Required Style Elements" and design_attrs if provided.
             Design Language: {design_language} # This should align with instruction_rules' "Required Style Elements" and design_attrs if provided.
-            
+
             {consistency_instruction}
 
             Key Requirements:
@@ -499,19 +503,19 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
             - Use large font sizes and bold text for emphasis where needed.
             - Generate as many tokens as possible to create a complete and detailed slide.
             """
-            
+
             # Get the response and extract the content
             llm_call_start_time = time.perf_counter()
-            logger.info(f"generate_slide #{slide_number}: Calling LLM_Claude.invoke.")
-            response = LLM_Claude.invoke(presentation_prompt, config=config)
+            logger.info(f"generate_slide #{slide_number}: Calling LLM.invoke.")
+            response = LLM.invoke(presentation_prompt)
             llm_call_duration = time.perf_counter() - llm_call_start_time
-            logger.info(f"generate_slide #{slide_number}: LLM_Claude.invoke completed in {llm_call_duration:.2f} seconds.")
+            logger.info(f"generate_slide #{slide_number}: LLM.invoke completed in {llm_call_duration:.2f} seconds.")
             raw_html_content = response.content if hasattr(response, 'content') else str(response)
-            
+
             # --- Start of new HTML robustness logic ---
             stripped_content = raw_html_content.strip()
             is_full_html = stripped_content.lower().startswith("<!doctype html>") and stripped_content.lower().endswith("</html>")
-            
+
             html_content_to_save = raw_html_content # By default, use the raw content
 
             if not is_full_html:
@@ -537,7 +541,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
 </head>
 <body>
     <div class="slide-container">
-        {raw_html_content} {/* Use original raw_html_content for wrapping */}
+        {raw_html_content}
     </div>
 </body>
 </html>"""
@@ -560,16 +564,16 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
             tool_duration = time.perf_counter() - tool_start_time
             logger.error(f"Failed to generate slide #{slide_number} after {tool_duration:.2f} seconds: {str(e)}", exc_info=True)
             return f"Failed to generate slide: {str(e)}", f"<div>Error generating slide: {str(e)}</div>"
-    
-    with open("rules/instruction.txt", "r") as f:
+
+    with open(RULES_INSTRUCTION_PATH, "r") as f:
         instruction = f.read()
-        
+
     prompt = f"""You are a presentation slide generator. Your task is to create slides based on the outline.
-    
+
     This is list of images that you can use for the slides: {images}
     This is the general instructions for all slides (including Required Style Elements from instruction.txt):
     {instruction}
-    
+
     Extracted design attributes from the first slide will be available under `state.extracted_design_attributes` after the first slide is generated and processed.
 
     Strategy:
@@ -597,15 +601,15 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
     - After `generate_slide` for slide 1, you MUST call `extract_design_attributes_from_html` using the HTML output of slide 1.
     - For `generate_slide` calls for slides 2+, ensure `first_slide_reference` is correctly passed (it's the HTML of slide 1). The `design_attrs` will be handled by the system if you've called the extraction tool correctly.
     """
-    
+
     # Define the tools available to this agent
     available_tools = [generate_slide, extract_design_attributes_from_html]
 
     slide_agent = create_react_agent(
-        model=LLM_Claude,
+        model=LLM,
         tools=available_tools,
         prompt=prompt
-    )    
+    )
     try:
         # Initialize extracted_design_attributes in state if not present
         if "extracted_design_attributes" not in state:
@@ -616,14 +620,14 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
         result = slide_agent.invoke(state, config=config)
         agent_invoke_duration = time.perf_counter() - agent_invoke_start_time
         logger.info(f"slide_agent_node: ReAct agent invocation completed in {agent_invoke_duration:.2f} seconds.")
-        
+
         # The 'slides' list in AgentState is intended to store a summary or reference for the supervisor/summarizer.
         # The actual first slide HTML for reference and extracted attributes are handled within this node's logic
         # and passed directly or via state to subsequent tool calls within this node's invocation.
 
         # The result from create_react_agent is a dictionary containing 'messages'.
         # We need to find the relevant ToolMessage to see what happened.
-        
+
         # It's tricky to update 'extracted_design_attributes' here directly if the ReAct agent doesn't explicitly output it.
         # The ReAct agent is responsible for calling the tools. The state updates should reflect the *outcome* of those calls.
 
@@ -649,7 +653,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
         # The key is that the `extracted_design_attributes` in the state is updated by the tool call.
         # The `slides` list in the state is mostly for the supervisor.
         # If generate_slide was called, we assume a slide was made.
-        
+
         # The actual update to 'extracted_design_attributes' will happen if the LLM calls the tool.
         # We need to ensure the ReAct agent is prompted to do so.
         # The current approach updates the state["slides"] which is used by the supervisor.
@@ -665,7 +669,7 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
 
         agent_messages = result.get("messages", [])
         last_response_message = agent_messages[-1] if agent_messages else HumanMessage(content="Slide agent processing complete.", name="slide_agent")
-        
+
         newly_extracted_attributes = state.get("extracted_design_attributes", {})
         first_slide_html_content_for_reference = state.get("first_slide_html_content", "") # Get existing or empty
 
@@ -746,53 +750,53 @@ def slide_agent_node(state: AgentState) -> Command[Literal["supervisor"]]:
             },
             goto="supervisor"
         )
-        
+
 def summarizer_node(state: AgentState) -> Command[Literal["supervisor"]]:
     """
     Agent that summarizes the presentation slides.
-    
+
     Args:
         state: The current state of the workflow
     """
     logger.info("summarizer_node: Starting slide summarization.")
-    
+
     slides = state["slides"]
     prompt = f"""
     You are a summarizer, tasked with summarizing the presentation slides.
-    
+
     This is the list of slides: {slides}
-    
+
     For each slide, analyze if it needs visual enhancement and provide a brief summary.
     Format your response as follows for each slide:
     Slide [number]: [brief summary] - [Needs visual enhancement/Visuals are good]
-    
+
     Example format:
     Slide 1: Introduction to the topic - Visuals are good
     Slide 2: Key concepts overview - Needs visual enhancement
     """
     llm_call_start_time = time.perf_counter()
     logger.info("summarizer_node: Calling LLM.invoke for summarization.")
-    response = LLM.invoke(prompt, config=config)
+    response = LLM.invoke(prompt, config=config) # Pass the config here
     llm_call_duration = time.perf_counter() - llm_call_start_time
     logger.info(f"summarizer_node: LLM.invoke for summarization completed in {llm_call_duration:.2f} seconds.")
-    
+
     summary_text = response.content.strip()
     logger.info("summarizer_node: Completed all slide summaries.")
-    
+
     return Command(
         update={
             "messages": [HumanMessage(content=summary_text, name="summarizer")],
-            "summary": summary_text
+            "summary": summary_text # Should be summary_text, not the raw list from state
         },
         goto="supervisor"
     )
 
 
 graph = StateGraph(AgentState)
-graph.add_node("supervisor", supervisor_node)
-graph.add_node("outline_agent", outline_agent_node)
-graph.add_node("slide_agent", slide_agent_node)
-graph.add_node("summarizer", summarizer_node)
+graph.add_node("supervisor", supervisor_node) # supervisor_node now accepts config
+graph.add_node("outline_agent", outline_agent_node) # outline_agent_node now accepts config
+graph.add_node("slide_agent", slide_agent_node) # slide_agent_node now accepts config
+graph.add_node("summarizer", summarizer_node) # summarizer_node now accepts config
 graph.add_edge(START, "supervisor")
 
 app = graph.compile()

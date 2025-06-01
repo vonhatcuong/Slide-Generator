@@ -32,10 +32,10 @@ os.makedirs(GENERATED_SLIDES_DIR, exist_ok=True)
 # Add argument schemas
 class SearchQuery(BaseModel):
     search_query: str
-    
+
 class UrlQuery(BaseModel):
     url: str
-    
+
 class PresentationOutlineQuery(BaseModel):
     topic: str
     instructions: str
@@ -99,10 +99,10 @@ async def _validate_image_url(session: aiohttp.ClientSession, original_item: dic
 async def image_search(search_query: str) -> dict: # Changed to async def
     """
     Search for images based on a query, and validate URLs asynchronously.
-    
+
     Args:
         search_query: The query string to search for images
-        
+
     Returns:
         Dictionary with search results including validated image URLs
     """
@@ -119,7 +119,7 @@ async def image_search(search_query: str) -> dict: # Changed to async def
         )["results"]
         searxng_duration = time.perf_counter() - searxng_start_time
         logger.info(f"image_search: Searxng().image_search completed in {searxng_duration:.2f} seconds.")
-        
+
         validated_results = []
         async with aiohttp.ClientSession() as session:
             validation_tasks = []
@@ -156,9 +156,9 @@ async def image_search(search_query: str) -> dict: # Changed to async def
 
         tool_duration = time.perf_counter() - tool_start_time
         logger.info(f"Async image_search tool execution completed in {tool_duration:.2f} seconds. Found {len(validated_results)} valid images from {len(results)} initial candidates for query '{search_query}'.")
-        
+
         return image_record
-    
+
     except Exception as e:
         tool_duration = time.perf_counter() - tool_start_time
         logger.error(f"Error in async image_search for query '{search_query}' after {tool_duration:.2f} seconds: {str(e)}", exc_info=True)
@@ -168,11 +168,11 @@ async def image_search(search_query: str) -> dict: # Changed to async def
 def web_search(search_query: str, ) -> dict:
     """
     Search for web content based on a query.
-    
+
     Args:
         search_query: The query string to search for web content
         searcher: Searxng instance to use for searching
-        
+
     Returns:
         Dictionary with search results including URLs and content
     """
@@ -188,7 +188,7 @@ def web_search(search_query: str, ) -> dict:
         )["results"]
         searxng_duration = time.perf_counter() - searxng_start_time
         logger.info(f"web_search: Searxng().webpage_search completed in {searxng_duration:.2f} seconds.")
-        
+
         # Extract only the url, title, content, and score fields
         filtered_results = []
         for result in full_results:
@@ -199,8 +199,8 @@ def web_search(search_query: str, ) -> dict:
                 "score": result.get("score", 0)
             }
             filtered_results.append(filtered_result)
-        
-        
+
+
         # Create a search record with timestamp and query
         search_record = {
             "query": search_query,
@@ -217,7 +217,7 @@ def web_search(search_query: str, ) -> dict:
         tool_duration = time.perf_counter() - tool_start_time
         logger.info(f"web_search tool execution completed in {tool_duration:.2f} seconds. Found {len(filtered_results)} results for query '{search_query}'.")
         return search_record
-    
+
     except Exception as e:
         tool_duration = time.perf_counter() - tool_start_time
         logger.error(f"Error in web_search for query '{search_query}' after {tool_duration:.2f} seconds: {str(e)}", exc_info=True)
@@ -239,7 +239,7 @@ async def _perform_crawl(session: aiohttp.ClientSession, url: str) -> dict:
         async with session.get(url, timeout=10, allow_redirects=True) as response: # Added allow_redirects
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             html_text = await response.text()
-        
+
         # Parsing logic
         soup_start_time = time.perf_counter()
         soup = BeautifulSoup(html_text, 'html.parser')
@@ -251,7 +251,7 @@ async def _perform_crawl(session: aiohttp.ClientSession, url: str) -> dict:
         cleaned_text = ' '.join(chunk for chunk in chunks if chunk)
         soup_duration = time.perf_counter() - soup_start_time
         logger.debug(f"_perform_crawl: BeautifulSoup parsing for {url} completed in {soup_duration:.4f} seconds.")
-        
+
         crawl_record = {
             "url": url,
             "content": cleaned_text[:6000]  # Store the first 6000 characters
@@ -295,7 +295,7 @@ def crawl_urls_concurrently(urls: List[str]) -> List[dict]:
         logger.info("No URLs provided to crawl_urls_concurrently.")
         return []
     logger.info(f"crawl_urls_concurrently: Starting concurrent crawl for {len(urls)} URLs.")
-    
+
     async def _crawl_all():
         async with aiohttp.ClientSession() as session:
             tasks = [_perform_crawl(session, url) for url in urls]
@@ -305,25 +305,29 @@ def crawl_urls_concurrently(urls: List[str]) -> List[dict]:
     results = []
     run_async_start_time = time.perf_counter()
     try:
-        # Try to get the current event loop
         loop = asyncio.get_event_loop_policy().get_event_loop()
         if loop.is_running():
-            logger.warning("crawl_urls_concurrently: Detected running asyncio loop. Attempting to schedule via run_coroutine_threadsafe.")
+            logger.info("crawl_urls_concurrently: Event loop is running. Using run_coroutine_threadsafe.")
             future = asyncio.run_coroutine_threadsafe(_crawl_all(), loop)
-            results = future.result(timeout=len(urls) * 15)
+            results = future.result(timeout=len(urls) * 15) # Adjust timeout as needed
         else:
+            logger.info("crawl_urls_concurrently: Event loop exists but is not running. Using asyncio.run().")
             results = asyncio.run(_crawl_all())
     except RuntimeError as e:
-        if "cannot be called when another asyncio loop is running" in str(e) or \
-           "Nesting asyncio.run() is not allowed" in str(e) or \
-           " asyncio.run() cannot be called from a running event loop" in str(e):
-            logger.error(f"Asyncio loop conflict in crawl_urls_concurrently: {e}. This tool should ideally be async or called from a synchronous context that can manage a new event loop.")
-            return [{"url": url, "content": "Failed to crawl due to asyncio loop conflict.", "error": str(e)} for url in urls]
-        logger.error(f"RuntimeError in crawl_urls_concurrently: {e}", exc_info=True)
-        return [{"url": url, "content": f"Failed to crawl due to runtime error: {e}", "error": str(e)} for url in urls]
+        if "no current event loop" in str(e).lower():
+            logger.info("crawl_urls_concurrently: No event loop in current thread. Using asyncio.run() to create and manage one.")
+            results = asyncio.run(_crawl_all())
+        elif "cannot be called when another asyncio loop is running" in str(e).lower() or \
+             "nesting asyncio.run() is not allowed" in str(e).lower() or \
+             "asyncio.run() cannot be called from a running event loop" in str(e).lower():
+            logger.error(f"Asyncio loop conflict in crawl_urls_concurrently: {e}. This tool may need to be redesigned or called differently.")
+            return [{"url": url_item, "content": "Failed to crawl due to asyncio loop conflict.", "error": str(e)} for url_item in urls]
+        else:
+            logger.error(f"Unhandled RuntimeError during asyncio setup in crawl_urls_concurrently: {e}", exc_info=True)
+            return [{"url": url_item, "content": f"Failed to crawl due to runtime error: {e}", "error": str(e)} for url_item in urls]
     except Exception as e:
         logger.error(f"Unexpected error in crawl_urls_concurrently's asyncio execution: {e}", exc_info=True)
-        return [{"url": url, "content": f"Failed to crawl due to unexpected error: {e}", "error": str(e)} for url in urls]
+        return [{"url": url_item, "content": f"Failed to crawl due to unexpected error: {e}", "error": str(e)} for url_item in urls]
 
     run_async_duration = time.perf_counter() - run_async_start_time
     logger.info(f"crawl_urls_concurrently: asyncio part (_crawl_all or run_coroutine_threadsafe) completed in {run_async_duration:.2f} seconds.")
@@ -374,7 +378,7 @@ def crawl_urls_concurrently(urls: List[str]) -> List[dict]:
 #     func=generate_presentation_outline,
 #     args_schema=PresentationOutlineQuery
 # )
-    
+
 # presentation_tool = StructuredTool(
 #     name="generate_presentation",
 #     description="Generate an HTML presentation slide. Requires five parameters: slide_number (int), title (string), content (string), layout (string), and style (string). Returns the file path of the generated slide.",
